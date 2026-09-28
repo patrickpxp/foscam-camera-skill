@@ -1,0 +1,3 @@
+interface:
+  display_name: "Foscam"
+  short_description: "Use Foscam camera audio, motion, and snapshots"
