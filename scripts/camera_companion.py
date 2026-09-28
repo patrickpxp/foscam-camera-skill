@@ -9,6 +9,7 @@ import argparse
 import base64
 import getpass
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -81,21 +82,51 @@ def ask_model(base_url, model, history, heard, snapshot):
     return reply
 
 
-def speak_through_camera(host, user, password, reply, workdir):
-    speech_wav = workdir / "sapi.wav"
+def speak_through_camera(host, user, password, reply, workdir, tts_backend):
+    speech_source = workdir / "speech-source"
     camera_wav = workdir / "camera-speech.wav"
-    script = (
-        "[Console]::InputEncoding=[System.Text.Encoding]::UTF8; "
-        "Add-Type -AssemblyName System.Speech; "
-        "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-        "$s.SetOutputToWaveFile($env:FOSCAM_TTS_WAV); "
-        "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()"
-    )
-    environment = {**os.environ, "FOSCAM_TTS_WAV": str(speech_wav)}
-    speech = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            input=reply, text=True, capture_output=True, env=environment, check=False)
-    if speech.returncode:
-        raise RuntimeError("Windows speech synthesis failed: " + speech.stderr)
+    text_file = workdir / "speech.txt"
+    text_file.write_text(reply, encoding="utf-8")
+    backend = tts_backend
+    if backend == "auto":
+        backend = {"Windows": "windows", "Darwin": "macos", "Linux": "espeak"}.get(platform.system())
+    if backend is None:
+        raise RuntimeError(f"No built-in speech synthesis backend for {platform.system()}; use --silent")
+    if backend == "windows":
+        powershell = shutil.which("powershell")
+        if not powershell:
+            raise RuntimeError("Windows speech synthesis requires Windows PowerShell; use --silent to skip speech")
+        speech_wav = speech_source.with_suffix(".wav")
+        script = (
+            "[Console]::InputEncoding=[System.Text.Encoding]::UTF8; "
+            "Add-Type -AssemblyName System.Speech; "
+            "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$s.SetOutputToWaveFile($env:FOSCAM_TTS_WAV); "
+            "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()"
+        )
+        environment = {**os.environ, "FOSCAM_TTS_WAV": str(speech_wav)}
+        speech = subprocess.run([powershell, "-NoProfile", "-Command", script],
+                                input=reply, text=True, capture_output=True, env=environment, check=False)
+        if speech.returncode:
+            raise RuntimeError("Windows speech synthesis failed: " + speech.stderr)
+    elif backend == "macos":
+        speech_wav = speech_source.with_suffix(".aiff")
+        say = shutil.which("say")
+        if not say:
+            raise RuntimeError("macOS speech synthesis requires the 'say' command; use --silent to skip speech")
+        speech = subprocess.run([say, "-f", str(text_file), "-o", str(speech_wav)],
+                                capture_output=True, text=True, check=False)
+        if speech.returncode:
+            raise RuntimeError("macOS speech synthesis failed: " + speech.stderr)
+    else:
+        speech_wav = speech_source.with_suffix(".wav")
+        espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+        if not espeak:
+            raise RuntimeError("Linux speech synthesis requires espeak-ng or espeak; use --silent to skip speech")
+        speech = subprocess.run([espeak, "-f", str(text_file), "-w", str(speech_wav)],
+                                capture_output=True, text=True, check=False)
+        if speech.returncode:
+            raise RuntimeError("eSpeak speech synthesis failed: " + speech.stderr)
     conversion = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(speech_wav),
          "-ac", "1", "-ar", "8000", "-c:a", "pcm_s16le", str(camera_wav)],
@@ -118,12 +149,12 @@ def main():
     parser.add_argument("--allow-model-download", action="store_true", help="Allow Faster Whisper to fetch its model")
     parser.add_argument("--text", help="Use typed text instead of the camera mic for a test turn")
     parser.add_argument("--silent", action="store_true", help="Print the reply without using the camera speaker")
+    parser.add_argument("--tts-backend", choices=("auto", "windows", "macos", "espeak"), default="auto",
+                        help="Speech synthesis backend (default: auto-detect for this operating system)")
     parser.add_argument("--loop", action="store_true", help="Keep listening for more turns")
     args = parser.parse_args()
     if args.seconds <= 0 or (args.text and args.loop):
         parser.error("--seconds must be positive, and --text cannot be used with --loop")
-    if os.name != "nt" and not args.silent:
-        parser.error("Camera speech uses Windows System.Speech; use --silent on other systems")
     if not shutil.which("ffmpeg"):
         parser.error("ffmpeg is required on PATH")
 
@@ -163,7 +194,7 @@ def main():
                     reply = ask_model(server, model_id, history, heard, snapshot)
                     print(f"Reply: {reply}", flush=True)
                     if not args.silent:
-                        speak_through_camera(args.host, args.user, password, reply, workdir)
+                        speak_through_camera(args.host, args.user, password, reply, workdir, args.tts_backend)
                     history.extend([{"role": "user", "content": heard},
                                     {"role": "assistant", "content": reply}])
                     history = history[-8:]
